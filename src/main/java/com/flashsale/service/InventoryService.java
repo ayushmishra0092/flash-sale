@@ -1,15 +1,18 @@
 package com.flashsale.service;
 
 import com.flashsale.dto.BookingEvent;
+import com.flashsale.dto.InventoryInit;
 import com.flashsale.entity.Order;
 import com.flashsale.entity.Product;
 import com.flashsale.repository.OrderRepository;
 import com.flashsale.repository.ProductRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
@@ -25,7 +28,7 @@ import java.util.UUID;
 public class InventoryService {
 
     private final RedisTemplate<String, Object> redisTemplate;
-    private final DefaultRedisScript<Long> inventoryDecrementScript;
+    private final RedisScript<String> inventoryDecrementScript;
     private final ProductRepository productRepository;
     private final OrderRepository orderRepository;
     private final KafkaTemplate<String, BookingEvent> kafkaTemplate;
@@ -35,6 +38,8 @@ public class InventoryService {
 
     @Value("${flashsale.kafka.topic.booking}")
     private String bookingTopic;
+
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     public void initializeInventory(Long productId) {
         Optional<Product> productOpt = productRepository.findById(productId);
@@ -47,7 +52,9 @@ public class InventoryService {
         Product product = productOpt.get();
         String inventoryKey = inventoryPrefix + productId;
 
-        redisTemplate.opsForValue().set(inventoryKey, product.getAvailableStock());
+        InventoryInit inventoryInit = new InventoryInit(product.getAvailableStock(), product.getPrice().doubleValue());
+
+        redisTemplate.opsForValue().set(inventoryKey, inventoryInit);
 
         log.info("Initialized inventory for product {}: {} units", productId, product.getAvailableStock());
     }
@@ -58,36 +65,36 @@ public class InventoryService {
             return BookingResult.failed("Invalid booking request");
         }
 
-        Optional<Product> productOpt = productRepository.findByIdAndActiveTrue(productId);
-        if (productOpt.isEmpty()) {
-            return BookingResult.failed("Product not found or inactive");
-        }
-
-        Product product = productOpt.get();
-
-        LocalDateTime now = LocalDateTime.now();
-        if (now.isBefore(product.getSaleStartTime()) || now.isAfter(product.getSaleEndTime())) {
-            return BookingResult.failed("Sale is not active");
-        }
-
         String inventoryKey = inventoryPrefix + productId;
-        Long result = redisTemplate.execute(
+        String scriptResult = redisTemplate.execute(
             inventoryDecrementScript,
             Collections.singletonList(inventoryKey),
             quantity,
             userId
         );
 
-        if (result == null || result == -1) {
-            return BookingResult.failed("Inventory not initialized");
-        } else if (result == 0) {
+        if (scriptResult == null) {
+            return BookingResult.failed("Product not available for sale");
+        } else if ("0".equals(scriptResult)) {
             log.info("Insufficient inventory for product {} - User: {}", productId, userId);
             return BookingResult.insufficientStock();
         }
 
+        InventoryInit updatedInventory;
+        try {
+            updatedInventory = OBJECT_MAPPER.readValue(scriptResult, InventoryInit.class);
+        } catch (JsonProcessingException ex) {
+            log.error("Failed to parse inventory result for product {}: {}", productId, ex.getMessage(), ex);
+            return BookingResult.failed("Failed to parse inventory result");
+        }
+
+        if (updatedInventory == null) {
+            return BookingResult.failed("Product not available for sale");
+        }
+
         // Booking successful in Redis - send event to Kafka
         String orderNumber = generateOrderNumber();
-        BigDecimal totalPrice = product.getPrice().multiply(BigDecimal.valueOf(quantity));
+        BigDecimal totalPrice = BigDecimal.valueOf(updatedInventory.getPrice()).multiply(BigDecimal.valueOf(quantity));
 
         BookingEvent event = BookingEvent.builder()
             .orderNumber(orderNumber)
@@ -118,8 +125,8 @@ public class InventoryService {
         String inventoryKey = inventoryPrefix + productId;
         Object inventory = redisTemplate.opsForValue().get(inventoryKey);
 
-        if (inventory instanceof Integer) {
-            return (Integer) inventory;
+        if (inventory instanceof InventoryInit) {
+            return ((InventoryInit) inventory).getAvailableStock();
         }
 
         return 0;
